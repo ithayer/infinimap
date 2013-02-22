@@ -1,5 +1,5 @@
 (ns infinimap.core)
-
+;; From: http://daly.axiom-developer.org/clojure.pdf
 ;; Black - a black leaf node with a null value
 ;; BlackVal - a black leaf node with a value
 ;; BlackBranch - a black interior node with children and a null value
@@ -31,11 +31,11 @@
   
   (replace   [_ key val left right]))
 
-(defn balance-left-del [a b c d])
-(defn balance-right-del [a b c d])
-
 (declare make-red)
 (declare make-black)
+
+(declare balance-left-del)
+(declare balance-right-del)
 
 (defn balance-left-all [this p]
   (make-black (get-key p) (get-val p) this (get-right p)))
@@ -44,7 +44,6 @@
   (make-black (get-key p) (get-val p) (get-left p) this))
 
 (deftype BlackNode [key val left right]
-  ;; A black leaf node with a null value.
   INode
   (get-left  [_] left)
   (get-right [_] right)
@@ -58,7 +57,7 @@
   (balance-left  [this p] (balance-left-all this p))
   (balance-right [this p] (balance-right-all this p))
 
-  (redden    [_]    (make-red key nil nil nil))
+  (redden    [_]    (make-red key val left right))
   (blacken   [this] this)
   
   (get-key   [_] key)
@@ -66,75 +65,136 @@
 
   (replace   [this key* val* left* right*] (BlackNode. key* val* left* right*)))
 
-(deftype BlackVal [key val left right]
-  ;; A black leaf node with a value.
+(defn make-black [key val left right]
+  (BlackNode. key val left right))
+
+(deftype RedNode [key val left right]
   INode
   (get-left  [_] left)
   (get-right [_] right)
 
-  (add-left  [this n] (balance-left n this))
-  (add-right [this n] (balance-right n this))
+  (add-left  [this n] (RedNode. key val n right))
+  (add-right [this n] (RedNode. key val left n))
 
-  (del-left  [this n] (balance-left-del  key val n    right))
-  (del-right [this n] (balance-right-del key val left n))
+  (del-left  [this n] (RedNode. key val n right))
+  (del-right [this n] (RedNode. key val left n))
 
-  (balance-left  [this p] (balance-left-all this p))
-  (balance-right [this p] (balance-right-all this p))
+  (balance-left  [this p] 
+    (if (nil? val)
+      (cond
+       (instance? RedNode left)
+       (RedNode. key val (blacken left)
+                 (BlackNode. (get-key p) (get-val p) right (get-right p)))
+       (instance? RedNode right)
+       (RedNode. (get-key right) (get-val right) 
+                 (BlackNode. key val left (get-left right))
+                 (BlackNode. (get-key p) (get-val p)
+                             (get-right right) (get-right p)))
+       :otherwise
+       (balance-left-all this p))))
 
-  (redden    [_]    (make-red key val nil nil))
-  (blacken   [this] this)
+  (balance-right [this p] 
+    (if (nil? val)
+      (cond
+       (instance? RedNode right)
+       (RedNode. key val 
+                 (BlackNode. (get-key p) (get-val p)
+                             (get-left p) left)
+                 (blacken right))
+       (instance? RedNode left)
+       (RedNode. key val
+                 (BlackNode. (get-key p) (get-val p)
+                             (get-left p) (get-left left))
+                 (BlackNode. key val (get-right left) right))
+       :otherwise
+       (balance-right-all this p))))
+
+  (redden    [_]    (throw (Exception. (str "Tried to redden red node: " key val left right))))
+  (blacken   [this] (BlackNode. key val left right))
   
   (get-key   [_] key)
   (get-val   [_] val)
 
-  (replace   [this key* val* left* right*] (BlackNode. key* val* left* right*)))
+  (replace   [this key* val* left* right*] (RedNode. key* val* left* right*)))
 
-(deftype BlackBranch [key val left right]
-  ;; A black interior node with children and a null value
-  INode
-  (get-left  [_] left)
-  (get-right [_] right)
+(defn make-red [key val left right]
+  (RedNode. key val left right))
 
-  (add-left  [this n] (balance-left n this))
-  (add-right [this n] (balance-right n this))
+(defn do-left-balance [key val n right]
+  (cond 
+   (and (instance? RedNode n)
+        (instance? RedNode (get-left n)))
+   (RedNode. (get-key n) (get-val n) (-> n get-left blacken)
+             (BlackNode. key val (get-right n) right))
+   
+   (and (instance? RedNode n)
+        (instance? RedNode (get-right n)))
+   (RedNode. (-> n get-right get-key) (-> n get-right get-val)
+             (BlackNode. (get-key n) (get-val n)
+                         (get-left n) (-> n get-right get-left))
+             (BlackNode. key val (-> n get-right get-right) right))
+   
+   :otherwise
+   (BlackNode. key val n right)))
 
-  (del-left  [this n] (balance-left-del  key val n    right))
-  (del-right [this n] (balance-right-del key val left n))
+(defn balance-right-del [key val left del]
+  (cond
+   (instance? RedNode del)
+   (RedNode. key val left (blacken del))
 
-  (balance-left  [this p] (balance-left-all this p))
-  (balance-right [this p] (balance-right-all this p))
+   (instance? BlackNode left)
+   (do-left-balance key val (redden left) del)
 
-  (redden    [_]    (make-red key nil left right))
-  (blacken   [this] this)
+   (and (instance? RedNode left)
+        (instance? BlackNode (get-right left)))
+   (let [lr (-> left get-right)]
+     (RedNode. (get-key lr) 
+               (get-val lr)
+               (do-left-balance (get-key left) (get-val left)
+                                (-> left get-left redden)
+                                (-> left get-right get-left))
+               (BlackNode. key val (-> lr get-right) del)))
+
+   :otherwise
+   (throw (Exception. (str "Couldn't balance-right-del: " key val left del)))))
+
+(defn do-right-balance [key val left n]
+  (cond
+   (and (instance? RedNode n)
+        (instance? RedNode (get-right n)))
+   (RedNode. (get-key n) (get-val n)
+             (BlackNode. key val left (get-left n))
+             (-> n get-right blacken))
+   
+   (and (instance? RedNode n)
+        (instance? RedNode (get-left n)))
+   (RedNode. (-> n get-left get-key) (-> n get-left get-val)
+             (BlackNode. key val left (-> n get-left get-left))
+             (BlackNode. (get-key n) (get-val n)
+                         (-> n get-left get-right) (get-right n)))
+   
+   :otherwise
+   (BlackNode. key val left n)))
+
+(defn balance-left-del [key val del right]
+  (cond
+   (instance? RedNode del)
+   (RedNode. key val (blacken del) right)
+   
+   (instance? BlackNode right)
+   (do-right-balance key val del (redden right))
+   
+   (and (instance? RedNode right)
+        (instance? BlackNode (get-left right)))
+   (let [rl (-> right get-left)]
+     (RedNode. (get-key rl) (get-val rl)
+               (BlackNode. key val del (-> rl get-left))
+               (do-right-balance (get-key right) (get-val right)
+                                 (-> rl get-right)
+                                 (-> right get-right redden))))
+   :otherwise
+   (throw (Exception. (str "Couldn't balance-left-del: " key val del right)))))
   
-  (get-key   [_] key)
-  (get-val   [_] val)
-
-  (replace   [this key* val* left* right*] (BlackNode. key* val* left* right*)))
-
-(deftype BlackBranchVal [key val left right]
-  ;; A black interior node with children and a value.
-  INode
-  (get-left  [_] left)
-  (get-right [_] right)
-
-  (add-left  [this n] (balance-left n this))
-  (add-right [this n] (balance-right n this))
-
-  (del-left  [this n] (balance-left-del  key val n    right))
-  (del-right [this n] (balance-right-del key val left n))
-
-  (balance-left  [this p] (balance-left-all this p))
-  (balance-right [this p] (balance-right-all this p))
-
-  (redden    [_]    (make-red key nil left right))
-  (blacken   [this] this)
-  
-  (get-key   [_] key)
-  (get-val   [_] val)
-
-  (replace   [this key* val* left* right*] (BlackNode. key* val* left* right*)))
-
 
 
 ;; (deftype DerefMap [m]
