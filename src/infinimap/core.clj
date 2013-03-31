@@ -1,13 +1,6 @@
 (ns infinimap.core)
 ;; From: http://daly.axiom-developer.org/clojure.pdf
-;; Black - a black leaf node with a null value
-;; BlackVal - a black leaf node with a value
-;; BlackBranch - a black interior node with children and a null value
-;; BlackBranchVal - a black interior node with children and a value
-;; Red - a red leaf node with a null value
-;; RedVal - a red leaf node with a value
-;; RedBranch - a red interior node with children and a null value
-;; RedBranchVal - a red interior node with children and a value
+
 
 (defprotocol INode 
   "Is an internal node."
