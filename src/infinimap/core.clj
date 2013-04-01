@@ -1,194 +1,111 @@
-(ns infinimap.core)
-;; From: http://daly.axiom-developer.org/clojure.pdf
+(ns infinimap.core
+  (:require [clojure.string :as string]))
 
+;; Next step: implement store for inner node
+;; -- other interface fns
+;; -- test/verification
+;; -- redis store node type
 
-(defprotocol INode 
-  "Is an internal node."
-  (get-left  [_])
-  (get-right [_])
+(defprotocol IDataNode
+  ;; An IDataNode can actually store elements.
+  (store  [n k v])
+  (delete [n k])
+  (lookup [n k])
+  (size   [n k])
+  (data [n]))
 
-  (add-left  [_ n])
-  (add-right [_ n])
+(def node-storage-size 4)
+(def node-allocation-size (* 2 node-storage-size))
+(def node-storage-mask 0x3)
 
-  (del-left  [_ n])
-  (del-right [_ n])
-  
-  (balance-left  [_ n])
-  (balance-right [_ n])
+(defn array-add! 
+  "Adds an element using chaining. Don't add to a full array, this is unchecked, it will spin."
+  ;; TODO: this should probably do strict equality testing on values also.
+  ([arr k v]
+     (array-add! arr k v (-> k hash (mod node-storage-size) (* 2))))
+  ([arr k v idx] ;; Index is relative to node-allocation-size.
+     (let [elem (aget arr idx)]
+       (if (or (nil? elem) (= elem k))
+         (do (println "adding " k "->" v "at" idx ", previously" (aget arr (inc idx)))
+             (aset arr idx k)
+             (aset arr (inc idx) v)
+             (nil? elem)) ;; Return true if newly added.
+         (array-add! arr k v (-> idx (+ 2) (mod node-allocation-size)))))))
 
-  (redden    [_] "Makes red.")
-  (blacken   [_] "Makes black.")
+(deftype InnerNode [m]
+  IDataNode
+  (store [_ k v]
+    (let [h-val (-> k (compute-level-hash (-> m :level)))]
+      (.store (aget (-> m :storage) h-val) k v)))
+  Object
+  (toString [_] 
+    (str (-> m (update-in [:storage] #(->> % (map str) (string/join " ")))))))
 
-  (get-key   [_])
-  (get-val   [_])
-  
-  (replace   [_ key val left right]))
+(declare make-data-node)
 
-(declare make-red)
-(declare make-black)
+(defn to-storage [h-vals]
+  (let [a* (make-array Object node-storage-size)]
+    (doseq [[h-val data-node] h-vals]
+      (aset a* h-val data-node))
+    a*))
 
-(declare balance-left-del)
-(declare balance-right-del)
+(defn compute-level-hash [k level]
+  (-> k
+      hash
+      (bit-shift-right (bit-shift-left level 2)) 
+      (bit-and node-storage-mask)))
 
-(defn balance-left-all [this p]
-  (make-black (get-key p) (get-val p) this (get-right p)))
+(defn make-inner-node
+  "Given a data node, returns an inner node that points to other data nodes."
+  [data]
+  (let [{:keys [storage size level]} data]
+    ;; Partition into hash values depending on the level.
+    (InnerNode. {:storage (->> (map vector (take-nth 2 storage) (take-nth 2 (rest storage)))
+                               (map (fn [[k v]]
+                                      (println "k:"k "v:"v)
+                                      (when k
+                                        (let [h-val (-> k (compute-level-hash level))]
+                                          {h-val [[k v]]}))))
+                               (apply merge-with concat)
+                               (map (fn [[h-val pairs]]
+                                      (println "h:" h-val "p:" pairs)
+                                      [h-val (make-data-node (inc level) pairs)]))
+                               (to-storage))
+                 :size size
+                 :level level})))
 
-(defn balance-right-all [this p]
-  (make-black (get-key p) (get-val p) (get-left p) this))
+(deftype DataNode [m]
+  IDataNode
+  (store [n k v]
+    (if (-> m :size (= (dec node-storage-size)))
+      (make-inner-node m)
+      (let [new-storage (-> m :storage aclone)
+            new-key?    (-> new-storage (array-add! k v))]
+        (DataNode. {:storage new-storage
+                    :level (:level m)
+                    :size (if new-key? (inc (:size m)) (:size m))}))))
+  (data [_] m)
+  Object
+  (toString [_] 
+    (str (-> m (update-in [:storage] #(->> % (map (fnil str "*nil*")) (string/join " ")))))))
 
-(deftype BlackNode [key val left right]
-  INode
-  (get-left  [_] left)
-  (get-right [_] right)
+(defn make-data-node [level pairs]
+  (DataNode. {:level level
+              :size (count pairs)
+              :storage (let [a* (make-array Object node-allocation-size)]
+                         (println "PAIRS: " pairs)
+                         (doseq [[k v] pairs]
+                           (array-add! a* k v))
+                         a*)}))
 
-  (add-left  [this n] (balance-left n this))
-  (add-right [this n] (balance-right n this))
-
-  (del-left  [this n] (balance-left-del  key val n    right))
-  (del-right [this n] (balance-right-del key val left n))
-
-  (balance-left  [this p] (balance-left-all this p))
-  (balance-right [this p] (balance-right-all this p))
-
-  (redden    [_]    (make-red key val left right))
-  (blacken   [this] this)
-  
-  (get-key   [_] key)
-  (get-val   [_] val)
-
-  (replace   [this key* val* left* right*] (BlackNode. key* val* left* right*)))
-
-(defn make-black [key val left right]
-  (BlackNode. key val left right))
-
-(deftype RedNode [key val left right]
-  INode
-  (get-left  [_] left)
-  (get-right [_] right)
-
-  (add-left  [this n] (RedNode. key val n right))
-  (add-right [this n] (RedNode. key val left n))
-
-  (del-left  [this n] (RedNode. key val n right))
-  (del-right [this n] (RedNode. key val left n))
-
-  (balance-left  [this p] 
-    (if (nil? val)
-      (cond
-       (instance? RedNode left)
-       (RedNode. key val (blacken left)
-                 (BlackNode. (get-key p) (get-val p) right (get-right p)))
-       (instance? RedNode right)
-       (RedNode. (get-key right) (get-val right) 
-                 (BlackNode. key val left (get-left right))
-                 (BlackNode. (get-key p) (get-val p)
-                             (get-right right) (get-right p)))
-       :otherwise
-       (balance-left-all this p))))
-
-  (balance-right [this p] 
-    (if (nil? val)
-      (cond
-       (instance? RedNode right)
-       (RedNode. key val 
-                 (BlackNode. (get-key p) (get-val p)
-                             (get-left p) left)
-                 (blacken right))
-       (instance? RedNode left)
-       (RedNode. key val
-                 (BlackNode. (get-key p) (get-val p)
-                             (get-left p) (get-left left))
-                 (BlackNode. key val (get-right left) right))
-       :otherwise
-       (balance-right-all this p))))
-
-  (redden    [_]    (throw (Exception. (str "Tried to redden red node: " key val left right))))
-  (blacken   [this] (BlackNode. key val left right))
-  
-  (get-key   [_] key)
-  (get-val   [_] val)
-
-  (replace   [this key* val* left* right*] (RedNode. key* val* left* right*)))
-
-(defn make-red [key val left right]
-  (RedNode. key val left right))
-
-(defn do-left-balance [key val n right]
-  (cond 
-   (and (instance? RedNode n)
-        (instance? RedNode (get-left n)))
-   (RedNode. (get-key n) (get-val n) (-> n get-left blacken)
-             (BlackNode. key val (get-right n) right))
-   
-   (and (instance? RedNode n)
-        (instance? RedNode (get-right n)))
-   (RedNode. (-> n get-right get-key) (-> n get-right get-val)
-             (BlackNode. (get-key n) (get-val n)
-                         (get-left n) (-> n get-right get-left))
-             (BlackNode. key val (-> n get-right get-right) right))
-   
-   :otherwise
-   (BlackNode. key val n right)))
-
-(defn balance-right-del [key val left del]
-  (cond
-   (instance? RedNode del)
-   (RedNode. key val left (blacken del))
-
-   (instance? BlackNode left)
-   (do-left-balance key val (redden left) del)
-
-   (and (instance? RedNode left)
-        (instance? BlackNode (get-right left)))
-   (let [lr (-> left get-right)]
-     (RedNode. (get-key lr) 
-               (get-val lr)
-               (do-left-balance (get-key left) (get-val left)
-                                (-> left get-left redden)
-                                (-> left get-right get-left))
-               (BlackNode. key val (-> lr get-right) del)))
-
-   :otherwise
-   (throw (Exception. (str "Couldn't balance-right-del: " key val left del)))))
-
-(defn do-right-balance [key val left n]
-  (cond
-   (and (instance? RedNode n)
-        (instance? RedNode (get-right n)))
-   (RedNode. (get-key n) (get-val n)
-             (BlackNode. key val left (get-left n))
-             (-> n get-right blacken))
-   
-   (and (instance? RedNode n)
-        (instance? RedNode (get-left n)))
-   (RedNode. (-> n get-left get-key) (-> n get-left get-val)
-             (BlackNode. key val left (-> n get-left get-left))
-             (BlackNode. (get-key n) (get-val n)
-                         (-> n get-left get-right) (get-right n)))
-   
-   :otherwise
-   (BlackNode. key val left n)))
-
-(defn balance-left-del [key val del right]
-  (cond
-   (instance? RedNode del)
-   (RedNode. key val (blacken del) right)
-   
-   (instance? BlackNode right)
-   (do-right-balance key val del (redden right))
-   
-   (and (instance? RedNode right)
-        (instance? BlackNode (get-left right)))
-   (let [rl (-> right get-left)]
-     (RedNode. (get-key rl) (get-val rl)
-               (BlackNode. key val del (-> rl get-left))
-               (do-right-balance (get-key right) (get-val right)
-                                 (-> rl get-right)
-                                 (-> right get-right redden))))
-   :otherwise
-   (throw (Exception. (str "Couldn't balance-left-del: " key val del right)))))
-  
-
+(deftype EmptyDataNode []
+  IDataNode
+  (store [_ k v]
+    (let [new-storage (make-array Object node-allocation-size)]
+      (array-add! new-storage k v)
+      (DataNode. {:storage new-storage
+                  :level 0
+                  :size  1}))))
 
 ;; (deftype DerefMap [m]
 
