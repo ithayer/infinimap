@@ -1,22 +1,25 @@
 (ns infinimap.core
   (:require [clojure.string :as string]))
 
-;; Next step: implement store for inner node
-;; -- other interface fns
+;; Next step: -- lookup interface fn.
 ;; -- test/verification
+;; -- other interface fns
 ;; -- redis store node type
+;; --- can use zunionstore or sunionstore to copy a set/zset
 
 (defprotocol IDataNode
   ;; An IDataNode can actually store elements.
   (store  [n k v])
   (delete [n k])
   (lookup [n k])
-  (size   [n k])
+  (size   [n])
   (data [n]))
 
 (def node-storage-size 4)
 (def node-allocation-size (* 2 node-storage-size))
 (def node-storage-mask 0x3)
+
+(defn uuid [] (java.util.UUID/randomUUID))
 
 (defn array-add! 
   "Adds an element using chaining. Don't add to a full array, this is unchecked, it will spin."
@@ -32,14 +35,32 @@
              (nil? elem)) ;; Return true if newly added.
          (array-add! arr k v (-> idx (+ 2) (mod node-allocation-size)))))))
 
+(defn compute-level-hash [k level]
+  (-> k
+      hash
+      (bit-shift-right (bit-shift-left level 2)) 
+      (bit-and node-storage-mask)))
+
 (deftype InnerNode [m]
   IDataNode
   (store [_ k v]
     (let [h-val (-> k (compute-level-hash (-> m :level)))]
-      (.store (aget (-> m :storage) h-val) k v)))
+      (let [storage-copy (-> m :storage aclone)]
+        (println "About to aset:" (map str storage-copy))
+        (aset storage-copy h-val (.store (aget (-> m :storage) h-val) k v))
+        (println "aset:" (map str storage-copy))
+        (InnerNode. {:storage storage-copy
+                     :size (-> m :size
+                               (- (.size (aget (-> m :storage) h-val)))
+                               (+ (.size (aget storage-copy h-val))))
+                     :level (-> m :level)
+                     :id (uuid)}))))
+  (size [_]
+    (-> m :size))
   Object
   (toString [_] 
-    (str (-> m (update-in [:storage] #(->> % (map str) (string/join " ")))))))
+    (str (format "(InnerNode[%d] id=%s size=%d " (:level m) (str (:id m)) (:size m)) 
+         (-> m :storage (->> (map (fnil str "*nil*")) (string/join " "))) ")")))
 
 (declare make-data-node)
 
@@ -49,11 +70,6 @@
       (aset a* h-val data-node))
     a*))
 
-(defn compute-level-hash [k level]
-  (-> k
-      hash
-      (bit-shift-right (bit-shift-left level 2)) 
-      (bit-and node-storage-mask)))
 
 (defn make-inner-node
   "Given a data node, returns an inner node that points to other data nodes."
@@ -72,7 +88,8 @@
                                       [h-val (make-data-node (inc level) pairs)]))
                                (to-storage))
                  :size size
-                 :level level})))
+                 :level level
+                 :id (uuid)})))
 
 (deftype DataNode [m]
   IDataNode
@@ -83,8 +100,11 @@
             new-key?    (-> new-storage (array-add! k v))]
         (DataNode. {:storage new-storage
                     :level (:level m)
-                    :size (if new-key? (inc (:size m)) (:size m))}))))
+                    :size (if new-key? (inc (:size m)) (:size m))
+                    :id (uuid)}))))
   (data [_] m)
+  (size [_]
+    (-> m :size))
   Object
   (toString [_] 
     (str (-> m (update-in [:storage] #(->> % (map (fnil str "*nil*")) (string/join " ")))))))
@@ -96,7 +116,8 @@
                          (println "PAIRS: " pairs)
                          (doseq [[k v] pairs]
                            (array-add! a* k v))
-                         a*)}))
+                         a*)
+              :id (uuid)}))
 
 (deftype EmptyDataNode []
   IDataNode
@@ -105,7 +126,10 @@
       (array-add! new-storage k v)
       (DataNode. {:storage new-storage
                   :level 0
-                  :size  1}))))
+                  :size  1
+                  :id 0})))
+  (size [_]
+    0))
 
 ;; (deftype DerefMap [m]
 
