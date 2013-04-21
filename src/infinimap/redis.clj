@@ -24,10 +24,14 @@
 (defprotocol INodeInfoStore
   (empty  [s]
     "This returns the canonical id of the empty element.")
+  (generate-id [s]
+    "Generates a unique id.")
   (put!   [s id k v]
     "Set the key and value in node 'id'. Returns true if element existed, false otherwise.")
   (get    [s id k]
     "Get the value of key k in node 'id'.")
+  (create [s id m]
+    "Create a new key/value map for node 'id'.")
   (read   [s id]
     "Gets the entire key/value map for node 'id'.")
   (copy!  [s id]
@@ -55,10 +59,14 @@
 (deftype MemoryNodeInfoStore [options]
   INodeInfoStore
   (empty  [s] 0)
+  (generate-id [s]
+    (uuid))
   (put!   [s id k v]
     (-> options :store (swap!-exists? [id k] v)))
   (get    [s id k]
     (-> options :store deref (clojure.core/get-in [id k])))
+  (create [s id m]
+    (dosync (alter (-> options :store) assoc id m)))
   (read   [s id]
     (-> options :store deref (clojure.core/get id)))
   (copy!  [s id]
@@ -90,29 +98,68 @@
       (bit-shift-right (bit-shift-left level 2)) 
       (bit-and node-storage-mask)))
 
-(defn make-inner-node [m]
-  ;; !! LEFT HERE
+(declare make-data-node)
 
-  ;; -- construct a new id. (might need a new interface fn on the store)
+(deftype InnerNode [m data]
+  IDataNode
+  (store [_ k v]
+    (println "Store not implemented for inner node.")))
 
-  ;; -- take all of the elements at node m, find their hash at this
-  ;;    level, and construct new data nodes out of those groups. we
-  ;;    should find a way to efficiently copy the data elements.
-  
-  ;; -- return an inner node that points to those newly created data nodes.
-  )
+
+;; TODO: find a way to efficiently copy data elements on the store.
+(defn make-inner-node
+  [m storage]
+  ;; !! LEFT HERE -- right now an inner node stores its data in-process.
+
+  ;; -- but what is it's data? it's data is DataNodes or
+  ;; InnerNodes. 
+  ;;
+  ;; Inner Nodes' data is a map of level-hash -> DataNode or
+  ;; InnerNode.  It doesn't make sense to make this a map of
+  ;; level-hash -> id unless complete nodes are stored on the store
+  ;; (because then we'd need to go look up the id, then find it in the
+  ;; process' hash). And if it's not a map of level-hash -> id, then
+  ;; there's nothing else it can be, the inner nodes would need to be
+  ;; in-process only.
+
+  ;; And if we kept inner nodes inside the process then we'd not be
+  ;; able to share it across other machines. So, we should store full
+  ;; node contents on hte store. That means to do proper GC, we'd need
+  ;; to do reference counting on the store.
+                                      
+  (println "Making inner node:  m")
+  (let [new-id (generate-id storage)
+        existing (read storage (-> m :id))
+        new-data (->> existing
+                      (group-by #(-> % first (compute-level-hash (-> m :level))))
+                      (map (fn [[hash-val data]]
+                             [hash-val (make-data-node (-> m :level inc) data storage)]))
+                      (into {}))]
+    (println "Creating storage cell :" new-id new-data)
+    (InnerNode. {:id new-id
+                 :level (-> m :level)
+                 :size (->> existing count)}
+                new-data)))
 
 (deftype DataNode [m storage]
   IDataNode
   (store [_ k v]
     (if (-> m :size (= (dec node-storage-size)))
-      (make-inner-node m)
+      (make-inner-node m storage)
       ;; Otherwise, we check if it exists to avoid making an unneeded copy.
       (let [new-id (copy! storage (-> m :id))
-            new-key? (put! storage (-> m :id) k v)]
+            new-key? (put! storage new-id k v)]
         (DataNode. {:id new-id
                     :level (:level m)
-                    :size (if new-key? (inc (:size m)) (:size m))})))))
+                    :size (if new-key? (inc (:size m)) (:size m))}
+                   storage)))))
+
+(defn make-data-node [level items storage]
+  (let [new-id (generate-id storage)]
+    (DataNode. {:id new-id
+                :level level
+                :size (->> items count)}
+               storage)))
 
 (deftype EmptyDataNode [storage]
   IDataNode
